@@ -22,7 +22,12 @@ def build_demo(demo_mode: bool):
 
     cfg = load_config()
     from trustrag.pipeline import build_pipeline
-    pipe = build_pipeline(cfg, with_gate=True, with_nli=not demo_mode)
+    # NLI must ALWAYS be enabled when the gate is active: the gate's scaler and
+    # coefficients were fitted on a feature set that includes nli_entail_max and
+    # nli_contradict_max. Feeding zero NLI features violates the feature-parity
+    # contract and biases the gate toward abstaining. In --demo mode, rely on
+    # cached generations (so it's fast) but still run NLI (it's a small CPU model).
+    pipe = build_pipeline(cfg, with_gate=True, with_nli=True)
 
     def run(query, documents, threshold):
         pages = [{"page_url": "", "page_name": f"doc{i}", "text": d}

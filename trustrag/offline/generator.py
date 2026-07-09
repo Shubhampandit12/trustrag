@@ -39,12 +39,20 @@ def extract_context_and_question(user_msg: str) -> tuple[list[str], str]:
     blocks = re.split(r"\[\d+\]\s*\(source:[^)]*\)\s*", ctx_text)
     sentences = []
     for block in blocks:
-        # Split on sentence boundaries
-        for sent in re.split(r"[.!?]+\s*", block):
+        # Split on sentence boundaries. Require the terminator NOT be between
+        # two digits (so "$4.2 billion" is not split at the decimal point) and
+        # be followed by whitespace/end, so mid-number periods stay intact.
+        for sent in re.split(r"(?<!\d)[.!?]+(?:\s+|$)", block):
             sent = sent.strip()
             if len(sent) > 10:
                 sentences.append(sent)
     return sentences, question
+
+
+def extract_idk_string(user_msg: str, default: str = "I don't know.") -> str:
+    """Recover the exact IDK string build_prompt injected (reply exactly "...")."""
+    m = re.search(r'reply exactly "(.+?)"\.?\s*$', user_msg)
+    return m.group(1) if m else default
 
 
 class OfflineGenerator:
@@ -62,13 +70,16 @@ class OfflineGenerator:
                 user_msg = m.get("content", "")
                 break
 
+        # Recover the exact IDK string the prompt asked us to emit.
+        idk = extract_idk_string(user_msg)
+
         sentences, question = extract_context_and_question(user_msg)
         if not sentences or not question:
-            return "I don't know."
+            return idk
 
         q_tokens = set(_tokenize(question))
         if not q_tokens:
-            return "I don't know."
+            return idk
 
         # Score each sentence by token-overlap with the question
         scored = []
@@ -81,7 +92,7 @@ class OfflineGenerator:
         scored.sort(key=lambda x: x[0], reverse=True)
 
         if not scored:
-            return "I don't know."
+            return idk
 
         best_score, best_sent = scored[0]
 
@@ -95,7 +106,7 @@ class OfflineGenerator:
         else:
             # Weak evidence: decide between IDK and hallucination
             if (h % 100) < int(self.idk_prob * 100):
-                return "I don't know."
+                return idk
             else:
                 # Generate an ungrounded guess (NOT from context)
                 return self._fabricate(question, h)

@@ -12,10 +12,16 @@ Usage: python -m trustrag.data.synth_crag
 from __future__ import annotations
 
 import bz2
+import hashlib
 import json
 from pathlib import Path
 
 import numpy as np
+
+
+def _stable_hash(s: str) -> int:
+    """Process-independent hash (builtin hash() is salted per-process)."""
+    return int.from_bytes(hashlib.md5(s.encode("utf-8")).digest()[:8], "big")
 
 # ============ FACT BANK ============
 # (entity, attribute, value, domain)
@@ -58,6 +64,9 @@ FACTS = [
 
 QUESTION_TYPES = ["simple", "comparison", "aggregation", "multi_hop",
                   "false_premise", "set", "post_processing", "multi_turn"]
+# Non-false-premise types: used for answerable/unanswerable records so their
+# question_type never mislabels them as false_premise.
+NON_FP_TYPES = [t for t in QUESTION_TYPES if t != "false_premise"]
 
 DIFFICULTIES = ["answerable_easy", "answerable_hard", "false_premise", "unanswerable"]
 DIFF_WEIGHTS = [0.45, 0.20, 0.15, 0.20]
@@ -110,7 +119,7 @@ def _gold_sentence(entity: str, attribute: str, value: str) -> str:
         f"{entity} reported {attribute} at {value}.",
     ]
     # deterministic pick based on entity hash
-    idx = hash(entity) % len(templates)
+    idx = _stable_hash(entity) % len(templates)
     return templates[idx]
 
 
@@ -120,7 +129,7 @@ def _make_query(entity: str, attribute: str) -> str:
         f"What is {entity}'s {attribute}?",
         f"Can you tell me the {attribute} for {entity}?",
     ]
-    idx = hash(entity + attribute) % len(templates)
+    idx = _stable_hash(entity + attribute) % len(templates)
     return templates[idx]
 
 
@@ -140,11 +149,13 @@ def generate_synthetic_crag(out_path: str, n: int = 600, seed: int = 13) -> None
         entity, attribute, value, domain = FACTS[fact_idx]
         gold_sent = _gold_sentence(entity, attribute, value)
 
-        # Assign question_type
+        # Assign question_type. Only the false_premise DIFFICULTY gets the
+        # false_premise type; all others draw from NON_FP_TYPES so their type
+        # never falsely reads as false_premise (keeps the per-type table honest).
         if diff == "false_premise":
             qtype = "false_premise"
         else:
-            qtype = QUESTION_TYPES[int(rng.integers(0, len(QUESTION_TYPES) - 1))]  # exclude false_premise
+            qtype = NON_FP_TYPES[int(rng.integers(0, len(NON_FP_TYPES)))]
 
         # Build pages (3-5 pages, each with 2-4 sentences as HTML)
         n_pages = int(rng.integers(3, 6))

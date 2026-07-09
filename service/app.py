@@ -7,6 +7,7 @@ per request to stdout (no Prometheus scrape stack — see plan §10).
 from __future__ import annotations
 
 import json
+import os
 import time
 
 from fastapi import FastAPI
@@ -49,7 +50,7 @@ def answer(req: AnswerRequest):
         reason=ans.reason,
         citations=[Citation(page_url=u, page_name="") for u in ans.citations],
         meta={"latency_ms": latency_ms, "n_docs": len(pages),
-              "model": _STATE["cfg"].generate.model_env},
+              "model": os.environ.get(_STATE["cfg"].generate.model_env, "unknown")},
     )
     print(json.dumps({"event": "answer", "query": req.query[:120],
                       "abstained": ans.abstained, "confidence": round(ans.confidence, 3),

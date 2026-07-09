@@ -130,6 +130,11 @@ def train_gate(
     from eval.metrics import net_score_vs_threshold
 
     feature_names = feature_names or list(FEATURE_NAMES)
+    if len(np.unique(y_fit)) < 2:
+        raise ValueError(
+            "train_gate requires samples of BOTH classes (correct + incorrect) in y_fit. "
+            f"Got only class(es): {np.unique(y_fit).tolist()}. Check your scorer/data."
+        )
     scaler = StandardScaler().fit(X_fit)
     # L2 is the LogisticRegression default; passing penalty= is deprecated in
     # newer sklearn, so we rely on the default and tune only C.
@@ -178,6 +183,8 @@ def naive_threshold_gate(signal_values: np.ndarray, y: np.ndarray):
     """
     from eval.metrics import net_score_vs_threshold
     sig = np.asarray(signal_values, dtype=float)
+    if sig.size == 0:
+        return 0.5, 0.0, np.array([])
     lo, hi = np.min(sig), np.max(sig)
     conf = (sig - lo) / (hi - lo) if hi > lo else np.zeros_like(sig)
     sweep = net_score_vs_threshold(conf, y)

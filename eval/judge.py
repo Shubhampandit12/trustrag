@@ -33,8 +33,9 @@ _FEWSHOTS = [
 ]
 
 
-def cache_key(query: str, gold: str, pred: str) -> str:
-    raw = f"{query}␟{gold}␟{pred}".encode()
+def cache_key(query: str, gold: str, pred: str, alts: list[str] | None = None) -> str:
+    alt_str = "|".join(sorted(alts)) if alts else ""
+    raw = f"{query}␟{gold}␟{alt_str}␟{pred}".encode()
     return hashlib.sha1(raw).hexdigest()
 
 
@@ -98,7 +99,7 @@ def make_llm_judge(
 
     def judge(pred: str, gold: str, alts: list[str]) -> str:
         query = query_getter() if query_getter else ""
-        key = cache_key(query, gold, pred)
+        key = cache_key(query, gold, pred, alts)
         cached = cache.get(key)
         if cached is not None:
             return cached

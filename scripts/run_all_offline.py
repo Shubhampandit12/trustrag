@@ -219,8 +219,12 @@ def main():
         (top1_cal - lo) / max(hi - lo, 1e-9), y_fit
     ).tau_star
     te_top1 = np.clip((X_test_raw[:, i_top1] - lo) / max(hi - lo, 1e-9), 0, 1)
-    b2_labels = [("missing" if p < b2_tau else ("correct" if c else "incorrect"))
-                 for c, p in zip(correct_test, te_top1)]
+    # When B2 chooses to answer it delivers the raw answer unchanged, so use its
+    # true CRAG label (b1_labels distinguishes "missing" IDKs from "incorrect");
+    # when B2 abstains the label is "missing". Using b1_labels (not the binary
+    # correct_test) avoids unfairly scoring an IDK raw answer as -1.
+    b2_labels = [("missing" if p < b2_tau else lab)
+                 for lab, p in zip(b1_labels, te_top1)]
     b2 = crag_metrics(b2_labels)
     print(f"[week3] B2 (naive)  : net={b2['net_score']:.3f}")
 

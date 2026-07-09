@@ -297,10 +297,13 @@ class OfflineNLI:
             if topic_overlap > 0.0:
                 chunk_nums = _extract_numbers(ctext)
                 if ans_nums and chunk_nums:
-                    matched = any(
-                        _num_close(a, c) for a in ans_nums for c in chunk_nums
-                    )
-                    if not matched:
+                    # Fire a numeric conflict unless the answer's KEY value (its
+                    # last number — the payload, e.g. "$4.2 billion") has a close
+                    # match in the chunk. Using `any` over all pairs would let an
+                    # incidental shared number (a year/quarter) mask a real value
+                    # conflict, so we anchor on the answer's key number.
+                    key_ans = ans_nums[-1]
+                    if not any(_num_close(key_ans, c) for c in chunk_nums):
                         conflict = max(conflict, self._NUMERIC_CONFLICT)
                 if _NEG_RE.search(ctext.lower()):
                     conflict = max(conflict, self._NEGATION_CONFLICT)
@@ -347,16 +350,21 @@ def make_offline_judge(
         pred_nums = _extract_numbers(pred)
 
         best_f1 = 0.0
+        numeric_mismatch = False  # both sides numeric on some gold, but no match
         for g in golds:
             g = str(g)
             # Numeric agreement is a strong, precise correctness signal.
             gold_nums = _extract_numbers(g)
-            if pred_nums and gold_nums and any(
-                _num_close(p, q, tol) for p in pred_nums for q in gold_nums
-            ):
-                return "correct"
+            if pred_nums and gold_nums:
+                if any(_num_close(p, q, tol) for p in pred_nums for q in gold_nums):
+                    return "correct"
+                # Numbers present on both sides but none agree: the core fact is
+                # wrong. Don't let shared prose (e.g. "billion") rescue it via F1.
+                numeric_mismatch = True
             best_f1 = max(best_f1, _token_f1(pred_tokens, _tokenize(g)))
 
+        if numeric_mismatch:
+            return "incorrect"
         return "correct" if best_f1 >= thr else "incorrect"
 
     return judge
