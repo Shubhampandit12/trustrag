@@ -1,0 +1,49 @@
+# Single source of truth. Loaded into a plain dataclass by trustrag/config.py.
+seed: 13
+
+data:
+  raw_path: data/raw/crag_task_1_and_2_dev_v4.jsonl.bz2
+  splits_dir: splits
+  # Reconcile against the real download: `bzcat data/raw/*.jsonl.bz2 | wc -l`
+  # Task 1 dev is ~2706 QA pairs, ~5 pages/question (NOT 50 — that is Task 3).
+  test_size: 0.5          # 50/50 dev/test by interaction_id
+  calib_size: 0.3         # of dev -> dev_calib; rest dev_fit
+  stratify_on: [domain, question_type]
+
+retrieve:
+  embedder_model: BAAI/bge-base-en-v1.5
+  query_instruction: "Represent this sentence for searching relevant passages: "
+  reranker_model: BAAI/bge-reranker-base
+  chunk_tokens: 512
+  chunk_overlap: 64
+  top_k: 20               # dense retrieve
+  top_n: 5                # rerank keep
+  rerank_tau: 0.0         # logit threshold for n_chunks_above_tau coverage feature
+
+generate:
+  # vLLM OpenAI-compat endpoint; overridden by LLM_BASE_URL / LLM_MODEL env vars.
+  base_url_env: LLM_BASE_URL
+  model_env: LLM_MODEL
+  max_tokens: 256
+  temperature: 0.0
+  idk_string: "I don't know."
+
+nli:
+  model: MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli
+
+gate:
+  artifact_path: artifacts/gate.joblib
+  calibration: temperature   # temperature | isotonic
+  c: 1.0                      # L2 inverse-reg strength for LogisticRegression
+  # features are defined in trustrag/abstain/signals.py (FEATURE_NAMES)
+
+judge:
+  base_url_env: JUDGE_BASE_URL
+  model_env: JUDGE_MODEL
+  cache_path: artifacts/judge_cache.jsonl
+  finance_tolerance: 0.01     # ±1% numeric match for finance domain
+
+service:
+  gen_cache_dir: artifacts/gen_cache
+  host: 0.0.0.0
+  port: 8080

@@ -1,0 +1,17 @@
+# CRAG data is CC BY-NC 4.0 — NEVER commit it
+data/
+# model + generation artifacts (large, reproducible)
+artifacts/*.joblib
+artifacts/gen_cache/
+# tracking / caches
+wandb/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+.venv/
+venv/
+.ipynb_checkpoints/
+# keep committed frozen split IDs (splits/*.csv) and the gen_cache dir shape
+!artifacts/gen_cache/.gitkeep

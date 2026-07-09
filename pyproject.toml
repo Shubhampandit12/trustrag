@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trustrag"
+version = "0.1.0"
+description = "Grounded QA with a learned, calibrated hallucination-aware abstention gate (Meta KDD Cup 2024 CRAG, Task 1)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+# Runtime deps live in requirements.txt (heavy: torch/vllm/faiss) and
+# requirements-ci.txt (light: numpy/sklearn/pydantic). This keeps the eval
+# core importable without a GPU stack. See those files for pinned versions.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "ruff>=0.4"]
+
+[tool.setuptools.packages.find]
+include = ["trustrag*", "eval*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# E501: long lines tolerated in prompts/docstrings.
+# B905: zip() strict= — all our zips pair guaranteed-equal-length sequences.
+ignore = ["E501", "B905"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
