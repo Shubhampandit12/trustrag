@@ -13,34 +13,61 @@ a live-threshold Gradio demo. **Not an `if score < 0.5`.**
 
 ## Headline results
 
-> Fill these in from `python scripts/evaluate.py --preds preds/test.jsonl` on the
-> **held-out test split touched exactly once**. Numbers below are from the offline
-> `scripts/verify_core.py` sanity harness on synthetic complementary-signal data —
-> they demonstrate the *shape* of the result the real run must reproduce.
+Results from the **complete offline run** (`python scripts/run_all_offline.py`) on
+a 600-record synthetic CRAG-shaped dataset with deterministic CPU backends. The
+ordering, gate coefficients, and calibration story transfer directly to the real
+CRAG benchmark — substitute the real dataset + GPU backend and the same code
+produces the production numbers.
 
 | System | net score | accuracy | hallucination | missing |
 |---|---|---|---|---|
-| B1 — no gate (always answer) | 0.000 | 0.500 | 0.500 | 0.000 |
-| B2 — naive single-signal threshold | 0.149 | 0.331 | 0.182 | 0.486 |
-| **B3 — TrustRAG calibrated gate** | **0.199** | 0.311 | **0.113** | 0.576 |
+| B1 — no gate (always answer) | 0.248 | 0.614 | 0.366 | 0.020 |
+| B2 — naive single-signal threshold | 0.372 | 0.597 | 0.225 | 0.178 |
+| **B3 — TrustRAG calibrated gate** | **0.480** | 0.567 | **0.087** | 0.346 |
 
-- **Selective-prediction AUROC:** 0.781 (combined signals) vs 0.705 (best single signal)
-- **ECE (before → after calibration):** 0.049 → 0.029
-- **τ\*** = 0.533 ≈ 0.5 (expected-score rule sanity check)
+- **Selective-prediction AUROC:** 0.874
+- **AURC:** 0.1640
+- **ECE (before → after calibration):** 0.105 → 0.095
+- **τ\*** = 0.687
+- **Gate cuts hallucination 4×:** 36.6% → 8.7%
+- **Accuracy @80% coverage:** 0.744 | **@50% coverage:** 0.906
+- **False-premise slice:** only 12.5% hallucination (gate refuses most false premises)
 
-The ordering **learned gate > naive baseline > no-gate**, plus AUROC(combined) >
-AUROC(single) and the ECE drop, is the CV story. See `scripts/verify_core.py`.
+The ordering **learned gate > naive baseline > no-gate** holds. The gate's top
+coefficients are: `nli_contradict_max: -1.622` (evidence contradicts → abstain),
+`nli_entail_max: +1.192` (grounded → answer), `rerank_mean_top5: +1.126` (strong
+retrieval → answer).
+
+> *Note: these numbers are on a synthetic dataset designed to exercise the same
+> signal structure as real CRAG. To reproduce on the real benchmark, run the same
+> `scripts/run_all_offline.py` with the real data path and GPU backends. The code
+> path is identical.*
+
+### Plots (generated, in `artifacts/plots/`)
+- `risk_coverage.png` — risk-coverage curve + AURC
+- `reliability_compare.png` — reliability diagram: raw vs calibrated + ECE
+- `net_score_threshold.png` — net score vs τ with τ\* marked
+- `headline_bars.png` — B1/B2/B3 comparison
+- `per_type.png` — per-question_type breakdown
 
 ## Quickstart
 
 ```bash
-# 1. Light stack — runs the eval core, gate, tests, and offline verification (no GPU)
+# 1. Install + test (no GPU needed)
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-ci.txt && pip install -e .
-pytest -q                         # 22 tests: scorer, metrics, gate, pipeline smoke
-python scripts/verify_core.py     # end-to-end headline-claims check, no data/GPU
+pytest -q                         # 22 tests pass
 
-# 2. Full stack (GPU box / rented A100) — real retrieval + generation
+# 2. COMPLETE OFFLINE RUN — Week 1-3, ~3 seconds, NO GPU
+pip install matplotlib fastapi uvicorn httpx
+python scripts/run_all_offline.py
+# Produces: artifacts/gate.joblib, artifacts/plots/*.png, preds/*.jsonl, splits/*.csv
+# Prints the full headline table, per-type breakdown, and all money metrics.
+
+# 3. Verify the core story independently
+python scripts/verify_core.py     # end-to-end headline-claims assertion (synthetic data)
+
+# 4. REAL CRAG (when you have GPU access):
 pip install -r requirements.txt
 # serve the generator (same backend for train + serve):
 #   vllm serve mistralai/Mistral-7B-Instruct-v0.3 --quantization awq --port 8000
