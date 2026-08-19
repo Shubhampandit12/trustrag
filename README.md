@@ -1,146 +1,231 @@
-# TrustRAG — Grounded QA with a Learned, Calibrated Abstention Gate
+# TrustRAG
 
-Answers a factual question from retrieved evidence **or explicitly abstains**,
-scored on the [Meta KDD Cup 2024 CRAG](https://www.aicrowd.com/challenges/meta-comprehensive-rag-benchmark-kdd-cup-2024)
-benchmark's asymmetric objective (correct `+1`, abstain `0`, confident-wrong `−1`).
-The goal is **net truthfulness = accuracy − hallucination_rate**, not raw accuracy.
+A retrieval-augmented QA pipeline for the [Meta KDD Cup 2024 CRAG benchmark](https://www.aicrowd.com/challenges/meta-comprehensive-rag-benchmark-kdd-cup-2024)
+that answers a question from retrieved evidence or abstains, using a small
+learned classifier — not a hand-picked confidence threshold — to decide which.
 
-The differentiator is a **learned, calibrated selective-prediction gate** — an
-L2 logistic regression + temperature/isotonic calibration over backend-independent
-evidence signals — proven with a risk-coverage curve, reliability diagram, and
-selective-prediction AUROC, and served behind a Dockerized FastAPI endpoint with
-a live-threshold Gradio demo. **Not an `if score < 0.5`.**
+## 1. The problem
 
-## Headline results
+CRAG scores answers asymmetrically: correct is +1, a confident wrong answer
+is -1, and saying "I don't know" is 0. Under that scoring, a RAG pipeline
+that always answers gets punished hard for every hallucination, and the
+metric that matters is `net_score = accuracy - hallucination_rate`, not raw
+accuracy. So the real engineering problem isn't "generate an answer" — it's
+"decide, per question, whether the retrieved evidence actually supports an
+answer confident enough to be worth giving."
 
-Results from the **complete offline run** (`python scripts/run_all_offline.py`) on
-a 600-record synthetic CRAG-shaped dataset with deterministic CPU backends. The
-ordering, gate coefficients, and calibration story transfer directly to the real
-CRAG benchmark — substitute the real dataset + GPU backend and the same code
-produces the production numbers.
+The obvious first cut is a threshold on some retrieval score ("abstain if
+top rerank score < X"). This project instead trains a small logistic
+regression over several retrieval/grounding signals, calibrates its output
+probability, and picks the abstention threshold by sweeping CRAG's own net
+score on a held-out split.
 
-| System | net score | accuracy | hallucination | missing |
-|---|---|---|---|---|
-| B1 — no gate (always answer) | 0.383 | 0.690 | 0.307 | 0.003 |
-| B2 — naive single-signal threshold | 0.553 | 0.680 | 0.127 | 0.193 |
-| **B3 — TrustRAG calibrated gate** | **0.557** | 0.690 | **0.133** | 0.177 |
+## 2. How it works
 
-- **Selective-prediction AUROC:** 0.976
-- **AURC:** 0.0623
-- **ECE (before → after calibration):** 0.065 → 0.062
-- **τ\*** = 0.548 ≈ 0.5 (expected-score-rule sanity check passes!)
-- **Gate cuts hallucination by more than half:** 30.7% → 13.3%
-- **Accuracy @80% coverage:** 0.863 | **@50% coverage:** 1.000
-- All **5 plots** regenerated and saved in `artifacts/plots/`
+```
+CRAG record -> clean HTML -> chunk -> embed (bge-base) -> FAISS top-k
+   -> rerank (bge-reranker) top-n -> grounded prompt -> generate (vLLM Mistral-7B)
+   -> NLI-score the generation against its evidence
+   -> 7 backend-independent features -> calibrated gate p = P(correct)
+   -> answer if p >= tau*, else "I don't know."
+```
 
-The ordering **learned gate > naive baseline > no-gate** holds. tau\* lands at
-0.548 ≈ 0.5 as theory predicts. The learned gate's advantage over the naive
-baseline is modest (+0.004 net) because the synthetic data has clean signal
-structure — on real CRAG where NLI catches hallucinations that retrieval scores
-miss (the complementary-signal property), the delta widens significantly
-(demonstrated in `scripts/verify_core.py` where AUROC(combined) > AUROC(single)
-by +0.076).
+`TrustRAGPipeline.answer()` (`trustrag/pipeline.py`) is the single inference
+path — the batch evaluator, the FastAPI service, and the Gradio demo all call
+the same method. That's a deliberate choice, not an incidental one: the
+easiest way to get a silent train/serve mismatch in a system like this is to
+have the evaluation script build features one way and the serving code build
+them a slightly different way. Routing everything through one function makes
+that class of bug structurally impossible instead of something you have to
+remember to keep in sync.
 
-> *Note: these numbers are on a synthetic dataset designed to exercise the same
-> signal structure as real CRAG. To reproduce on the real benchmark, run the same
-> `scripts/run_all_offline.py` with the real data path and GPU backends. The code
-> path is identical.*
+The seven gate features live in `trustrag/abstain/signals.py`
+(`FEATURE_NAMES`): the top rerank score, the margin between the top two
+reranked chunks, mean of the top-5 rerank scores, a coverage count of chunks
+above a rerank threshold, max NLI entailment and contradiction between the
+generated answer and its evidence, and the answer's token length. None of
+them require the generator's token logprobs, which would be a stronger
+signal but only under the exact same backend the gate was calibrated on —
+deliberately left out so the Gradio demo (or any future backend swap) can't
+silently degrade the gate by dropping a feature it was trained on. The
+project calls this the "feature-parity contract" and enforces it structurally
+by having `extract_features()` be the only thing that produces gate inputs,
+at both train and serve time.
 
-### Plots (generated, in `artifacts/plots/`)
-- `risk_coverage.png` — risk-coverage curve + AURC
-- `reliability_compare.png` — reliability diagram: raw vs calibrated + ECE
-- `net_score_threshold.png` — net score vs τ with τ\* marked
-- `headline_bars.png` — B1/B2/B3 comparison
-- `per_type.png` — per-question_type breakdown
+The gate itself (`trustrag/abstain/gate.py`) is: `StandardScaler` -> L2
+`LogisticRegression` -> temperature (or isotonic) calibration on a held-out
+calibration fold -> `tau*` chosen as the threshold that maximizes CRAG net
+score on that fold. There's a built-in sanity check here worth knowing about:
+under CRAG's scoring, the expected value of answering is `2p - 1`, so a
+well-calibrated gate should pick `tau* ≈ 0.5` on its own — if a run comes back
+with `tau*` far from 0.5, that's a signal the calibration step did something
+wrong, not that 0.5 is a magic number to hardcode.
 
-## Quickstart
+## 3. The offline evaluation harness — and why it exists
+
+CRAG's real data is CC BY-NC 4.0 licensed (never committed here — see
+`.gitignore`), and the real pipeline needs a GPU serving Mistral-7B through
+vLLM plus `sentence-transformers`, `faiss`, and `transformers` for the
+retrieval/reranking/NLI stack. None of that is available in CI or on a
+laptop, which makes it easy to end up unable to test your own evaluation and
+calibration logic without spinning up expensive infrastructure first.
+
+`trustrag/offline/backends.py` sidesteps that by implementing torch-free,
+deterministic stand-ins for every heavy component: `OfflineEmbedder` is a
+hashing bag-of-words encoder with sublinear TF weighting, `OfflineReranker`
+is an actual BM25 implementation (not a stub — real IDF, real length
+normalization) run over the candidate set, and `OfflineNLI` approximates
+entailment as answer/chunk token overlap and contradiction as an on-topic
+chunk containing a conflicting number or a negation cue. They're not meant to
+be as good as the real bge/DeBERTa models — they're meant to produce
+real-valued, non-constant scores driven by the actual text, so that the gate
+training code, the calibration code, and the metrics code all run against
+inputs with genuine signal and can be verified before anyone pays for a GPU.
+`trustrag/data/synth_crag.py` generates a matching synthetic dataset in the
+real CRAG schema (bz2 JSONL, same record shape) with four question
+difficulties mixed in fixed proportions, so the shape of the eval loop can be
+exercised end to end.
+
+## 4. A gotcha this repo currently has
+
+While verifying this README I ran `scripts/run_all_offline.py`, which is
+supposed to be the single command that runs the whole offline demo end to
+end and prints a headline results table. It fails immediately:
+
+```
+ModuleNotFoundError: No module named 'trustrag.data.crag_loader'
+```
+
+`trustrag/data/crag_loader.py` and `trustrag/data/make_splits.py` are
+imported by both `scripts/run_all_offline.py` and `scripts/run_pipeline.py`
+(for `stream_records`, `record_to_pages`, `build_splits`, `load_split_ids`)
+but were never actually committed to the repo — `git log` and the working
+tree confirm they don't exist. `trustrag/data/synth_crag.py` (data
+generation) works fine standalone; it's the loading/splitting step
+immediately after it that's missing. Concretely, that means the "complete
+offline run" headline table this README previously advertised (specific net
+scores, AUROC, ECE numbers) was never actually produced by running that
+script — those numbers described what the pipeline was expected to produce,
+not what it did produce. That's worth saying plainly rather than repeating
+the numbers as if they were measured.
+
+What follows below is only what I could actually run.
+
+## 5. What's actually verified
+
+```
+$ pytest -q
+......................                                                   [100%]
+22 passed
+```
+
+The 22 tests cover the CRAG scorer (`tests/test_scorer.py`: abstention
+detection, exact/containment/numeric matching, the missing-beats-wrong rule,
+Cohen's kappa), the gate and selective-prediction metrics
+(`tests/test_metrics_gate.py`: AUROC, risk-coverage/AURC, ECE, the
+threshold sweep, gate training + joblib round-trip), and a pipeline smoke
+test with fake heavy components (`tests/test_pipeline_smoke.py`) that proves
+the chunk -> retrieve -> rerank -> generate -> signal -> gate wiring holds
+together in both abstention-off and gated modes.
+
+`scripts/verify_core.py` doesn't touch the broken data-loading path at all —
+it builds synthetic feature data directly from two independent latent
+factors (retrieval quality and grounding quality; correctness requires both
+to be good, which no single feature can capture alone) and runs it through
+the real `train_gate`/`crag_metrics`/`eval.metrics` functions. Actual output
+from running it:
+
+```
+=== CRAG headline (same test split, same scorer) ===
+system           net     acc   halluc  missing
+B1 nogate      0.000   0.500    0.500    0.000
+B2 naive       0.149   0.331    0.182    0.486
+B3 gate        0.199   0.311    0.113    0.576
+
+=== selective-prediction ===
+selective AUROC (gate) : 0.781   vs single-signal top1: 0.705
+AURC                   : 0.2852
+ECE raw->calib         : 0.0489 -> 0.0287
+acc@100% cov          : 0.500
+acc@ 80% cov          : 0.581
+acc@ 50% cov          : 0.700
+tau*                   : 0.533
+```
+
+Three things this actually shows: the ordering `learned gate (0.199) > naive
+single-signal threshold (0.149) > always-answer (0.000)` holds on net score;
+the gate's combined signal beats the single best feature at ranking
+correctness (AUROC 0.781 vs. 0.705), which is the whole point of learning a
+combination instead of thresholding one number; and calibration measurably
+tightens ECE (0.049 -> 0.029) while `tau*` lands at 0.533, close to the 0.5
+the expected-score-rule predicts. None of this says anything about accuracy
+on real CRAG questions — it's a synthetic sanity check on the gate-training
+and calibration *code*, deliberately constructed so a single feature
+provably can't solve it, to prove the learned combination is doing something
+a naive threshold can't. Getting real numbers on real CRAG data needs the
+loader modules from section 4 plus GPU access for the actual retrieval/
+generation/NLI models.
+
+## 6. Running it
 
 ```bash
-# 1. Install + test (no GPU needed)
+# Install the light stack (no torch/vllm/faiss) and run the tests
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-ci.txt && pip install -e .
-pytest -q                         # 22 tests pass
+pytest -q
 
-# 2. COMPLETE OFFLINE RUN — Week 1-3, ~3 seconds, NO GPU
-pip install matplotlib fastapi uvicorn httpx
-python scripts/run_all_offline.py
-# Produces: artifacts/gate.joblib, artifacts/plots/*.png, preds/*.jsonl, splits/*.csv
-# Prints the full headline table, per-type breakdown, and all money metrics.
+# Run the synthetic verification above (no GPU, no data, ~1s)
+python scripts/verify_core.py
 
-# 3. Verify the core story independently
-python scripts/verify_core.py     # end-to-end headline-claims assertion (synthetic data)
-
-# 4. REAL CRAG (when you have GPU access):
+# For the real CRAG pipeline you need a GPU and the licensed dataset:
 pip install -r requirements.txt
-# serve the generator (same backend for train + serve):
-#   vllm serve mistralai/Mistral-7B-Instruct-v0.3 --quantization awq --port 8000
+vllm serve mistralai/Mistral-7B-Instruct-v0.3 --quantization awq --port 8000
 export LLM_BASE_URL=http://localhost:8000/v1
+# scripts/run_pipeline.py and scripts/run_all_offline.py both need
+# trustrag/data/crag_loader.py + trustrag/data/make_splits.py, which aren't
+# in the repo yet (see section 4) — write those first.
 
-# 3. Data + splits  (VERIFY the row count — see plan §4)
-bzcat data/raw/*.jsonl.bz2 | wc -l
-python -c "from trustrag.data.make_splits import build_splits; \
-from trustrag.config import load_config, resolve_path as R; c=load_config(); \
-print(build_splits(R(c.data.raw_path), R(c.data.splits_dir)))"
-
-# 4. Generate labels (abstention OFF) -> train gate -> evaluate on test
-python scripts/run_pipeline.py --split dev_fit   --no-gate --out preds/dev_fit.jsonl
-python scripts/run_pipeline.py --split dev_calib --no-gate --out preds/dev_calib.jsonl
-python scripts/train_gate.py --fit preds/dev_fit.jsonl --calib preds/dev_calib.jsonl --use-judge
-python scripts/run_pipeline.py --split test --out preds/test.jsonl
-python scripts/evaluate.py --preds preds/test.jsonl --use-judge
-
-# 5. Serve + demo
-uvicorn service.app:app --port 8080          # POST /answer, GET /health
-python ui/gradio_app.py                        # live threshold slider; --demo for cached
+# Once a gate is trained and saved to artifacts/gate.joblib:
+uvicorn service.app:app --port 8080   # POST /answer, GET /health
+python ui/gradio_app.py               # live threshold slider demo
 ```
 
-## Architecture
-
-`TrustRAGPipeline.answer()` is the ONE inference path — batch eval, FastAPI, and
-Gradio all call it (zero train/serve drift). One generation backend (vLLM) is used
-identically for gate-training labels and serving, so the calibrated feature
-distribution never shifts.
+## 7. Layout
 
 ```
-CRAG record → clean HTML → chunk → embed (bge-base) → FAISS top-k
-   → rerank (bge-reranker) top-n → grounded prompt → generate (vLLM Mistral-7B)
-   → backend-independent signals (rerank stats + NLI + answer_len)
-   → calibrated gate p=P(correct) → answer iff p ≥ τ*  else  "I don't know."
+trustrag/
+  pipeline.py            single TrustRAGPipeline.answer() inference path
+  config.py               loads config.yaml into plain dataclasses
+  schemas.py               Chunk / ScoredChunk / Answer dataclasses
+  nli.py                    DeBERTa-v3 MNLI entailment/contradiction scoring
+  abstain/
+    signals.py                the 7 backend-independent gate features
+    gate.py                    LR + temperature/isotonic calibration + tau*
+  retrieve/
+    embedder.py                bge-base embedding + chunking
+    faiss_store.py              FAISS index with a pure-numpy fallback
+    reranker.py                  bge-reranker cross-encoder
+  generate/
+    generator.py                vLLM OpenAI-compatible client, disk-cached
+    prompt.py                    grounding + false-premise + IDK prompt
+  offline/
+    backends.py                torch-free BM25/hashing-BoW/lexical-NLI stand-ins
+    generator.py                 deterministic offline generator
+  data/
+    synth_crag.py               synthetic CRAG-schema data generator
+eval/
+  crag_scorer.py            rule-based scorer + LLM-judge residue path
+  metrics.py                  risk-coverage, AURC, selective AUROC, ECE
+  judge.py                     external pinned LLM judge, cached, Cohen's kappa
+service/app.py            FastAPI: POST /answer, GET /health
+ui/gradio_app.py           live abstention-threshold demo
+scripts/
+  verify_core.py           offline headline-claims check (no GPU/data)
+  run_all_offline.py        full offline demo (currently broken — see section 4)
+  run_pipeline.py            real-CRAG inference over a split
+  train_gate.py               fit + calibrate the gate from prediction logs
+  evaluate.py                   score a predictions file with the CRAG scorer
+tests/                     22 tests, see section 5
 ```
-
-**Feature-parity contract:** the gate is trained and served on the *identical*
-backend-independent feature set (`trustrag/abstain/signals.py::FEATURE_NAMES`).
-Token logprobs are a bonus feature only under an identical vLLM backend — excluded
-here so the demo can never silently drop a feature the gate was calibrated on.
-
-## Layout
-
-| Path | What |
-|---|---|
-| `eval/crag_scorer.py` | Exact CRAG scorer: rule path (regex→missing, exact/numeric match) + judge hook |
-| `eval/metrics.py` | net_score sweep, risk-coverage/AURC, selective AUROC, ECE, reliability bins |
-| `eval/judge.py` | External pinned LLM judge (cached), Cohen's κ for the judge audit |
-| `trustrag/abstain/signals.py` | The ~7 backend-independent uncertainty features |
-| `trustrag/abstain/gate.py` | LR + temperature/isotonic calibration + τ\* selection; `gate.joblib` |
-| `trustrag/pipeline.py` | The single inference path |
-| `service/` `ui/` | FastAPI service + Gradio demo (live threshold slider) |
-| `scripts/verify_core.py` | Offline headline-claims verification (no GPU/data) |
-
-## Definition of done (README must show, on the test split touched once)
-
-1. Headline table: net truthfulness **no-gate vs calibrated-gate** + accuracy + hallucination rate
-2. Risk-coverage curve + AURC  · 3. Reliability diagram + ECE before/after calibration
-4. Selective-prediction AUROC  · 5. Accuracy @ {100, 80, 50}% coverage
-6. Per-`question_type` breakdown highlighting the **`false_premise`** slice
-7. Judge audit: Cohen's **κ ≥ 0.8** vs human labels + pinned judge model/version
-8. **τ\* ≈ 0.5** reported near the net-score peak on test
-9. Architecture diagram + a real `{answer, citations, confidence, abstained}` response + Gradio link
-
-## Scope discipline
-
-Deliberately **not** built for the MVP (see the day-one plan): dual backends,
-docker-compose, CI eval-gate, self-consistency, LightGBM, embedding-cache infra,
-OmegaConf, external OOD sets, CRAG Task 2/3. Task 1 gives ~5 pages/question — the
-"~50 pages" figure is Task 3.
 
 Data is CC BY-NC 4.0 — `data/` is gitignored and must never be committed.
